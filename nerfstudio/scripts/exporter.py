@@ -492,6 +492,7 @@ class ExportGaussianSplat(Exporter):
 
         model: SplatfactoModel = pipeline.model
 
+        filename_bin = self.output_dir / "splat_bin.ply"
         filename = self.output_dir / "splat.ply"
 
         map_to_tensors = {}
@@ -543,7 +544,8 @@ class ExportGaussianSplat(Exporter):
 
         pcd = o3d.t.geometry.PointCloud(map_to_tensors)
 
-        o3d.t.io.write_point_cloud(str(filename), pcd)
+        o3d.t.io.write_point_cloud(str(filename), pcd,write_ascii=True)
+        o3d.t.io.write_point_cloud(str(filename_bin), pcd)
 
 
 Commands = tyro.conf.FlagConversionOff[
