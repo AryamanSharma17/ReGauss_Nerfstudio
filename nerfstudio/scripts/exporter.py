@@ -494,11 +494,15 @@ class ExportGaussianSplat(Exporter):
 
         filename_bin = self.output_dir / "splat_bin.ply"
         filename = self.output_dir / "splat.ply"
+        logfilename = self.output_dir / "positions.log"
+        indlogfilename = self.output_dir / "indpositions.log"
 
         map_to_tensors = {}
+        map_to_tensors2 = {}
 
         with torch.no_grad():
             positions = model.means.cpu().numpy()
+            print(type(positions), positions[0], type(positions[0]))
             n = positions.shape[0]
             map_to_tensors["positions"] = positions
             map_to_tensors["normals"] = np.zeros_like(positions, dtype=np.float32)
@@ -543,9 +547,34 @@ class ExportGaussianSplat(Exporter):
                 map_to_tensors[k] = map_to_tensors[k][select, :]
 
         pcd = o3d.t.geometry.PointCloud(map_to_tensors)
+        # pcd2 = o3d.t.geometry.PointCloud(map_to_tensors2)
+
+        # # Define the query point and radius
+        # query_point = np.array([0, 0, 0])  # Change this to your actual query point
+        # radius = 1.0  # Change this to your actual radius
+
+        # # Filter the point cloud
+        # filtered_pcd = filter_points_within_radius(pcd, query_point, radius)
+        
+        # # print(type(pcd))
+        # # with open(logfilename, 'w') as f:
+        # #     for position in map_to_tensors["positions"]:
+        # #         f.write(f"{position}\n")
+        # print(type(filtered_pcd))
+        # with open(logfilename, 'w') as f:
+        #     for position in np.asarray(filtered_pcd.points):
+        #         f.write(f"{position}\n")
+        # # for key,value in map_to_tensors.items():
+        # #     if isinstance(value, dict):  # If value is a dictionary, handle nested dictionary
+        # #         print(f"Number of elements in {key}: {len(value)}")
+        # #     else:  # Otherwise, it's a list
+        # #         print(f"Number of elements in {key}: {len(value)}")
+        
 
         o3d.t.io.write_point_cloud(str(filename), pcd,write_ascii=True)
         o3d.t.io.write_point_cloud(str(filename_bin), pcd)
+        # o3d.t.io.write_point_cloud(str(self.output_dir / "splat_pruned.ply"), pcd2,write_ascii=True)
+        # o3d.t.io.write_point_cloud(str(self.output_dir / "splat_pruned_bin.ply"), pcd2)
 
 
 Commands = tyro.conf.FlagConversionOff[
