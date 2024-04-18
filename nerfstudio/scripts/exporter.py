@@ -22,6 +22,8 @@ from __future__ import annotations
 import json
 import os
 import sys
+import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional, Tuple, Union, cast
@@ -34,11 +36,15 @@ from typing_extensions import Annotated, Literal
 
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager
-from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManager
+from nerfstudio.data.datamanagers.parallel_datamanager import \
+    ParallelDataManager
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.exporter import texture_utils, tsdf_utils
-from nerfstudio.exporter.exporter_utils import collect_camera_poses, generate_point_cloud, get_mesh_from_filename
-from nerfstudio.exporter.marching_cubes import generate_mesh_with_multires_marching_cubes
+from nerfstudio.exporter.exporter_utils import (collect_camera_poses,
+                                                generate_point_cloud,
+                                                get_mesh_from_filename)
+from nerfstudio.exporter.marching_cubes import \
+    generate_mesh_with_multires_marching_cubes
 from nerfstudio.fields.sdf_field import SDFField  # noqa
 from nerfstudio.models.splatfacto import SplatfactoModel
 from nerfstudio.pipelines.base_pipeline import Pipeline, VanillaPipeline
@@ -494,15 +500,11 @@ class ExportGaussianSplat(Exporter):
 
         filename_bin = self.output_dir / "splat_bin.ply"
         filename = self.output_dir / "splat.ply"
-        logfilename = self.output_dir / "positions.log"
-        indlogfilename = self.output_dir / "indpositions.log"
 
         map_to_tensors = {}
-        map_to_tensors2 = {}
 
         with torch.no_grad():
             positions = model.means.cpu().numpy()
-            print(type(positions), positions[0], type(positions[0]))
             n = positions.shape[0]
             map_to_tensors["positions"] = positions
             map_to_tensors["normals"] = np.zeros_like(positions, dtype=np.float32)
@@ -547,7 +549,104 @@ class ExportGaussianSplat(Exporter):
                 map_to_tensors[k] = map_to_tensors[k][select, :]
 
         pcd = o3d.t.geometry.PointCloud(map_to_tensors)
-        # pcd2 = o3d.t.geometry.PointCloud(map_to_tensors2)
+        o3d.t.io.write_point_cloud(str(filename), pcd,write_ascii=True)
+        o3d.t.io.write_point_cloud(str(filename_bin), pcd)
+
+@dataclass
+class ExportGaussianSplat_pointpruning(Exporter):
+    """
+    Export 3D Gaussian Splatting model to a .ply
+    """
+
+    def main(self) -> None:
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+
+        _, pipeline, _, _ = eval_setup(self.load_config)
+
+        assert isinstance(pipeline.model, SplatfactoModel)
+
+        model: SplatfactoModel = pipeline.model
+        
+        filename_bin = self.output_dir / "splat_bin.ply"
+        filename = self.output_dir / "splat.ply"
+        # logfilename = self.output_dir / "positions.log"
+        # indlogfilename = self.output_dir / "indpositions.log"
+        # prunedfilename = self.output_dir / "splat_pruned.log"
+
+        map_to_tensors = {}
+
+        with torch.no_grad():
+            origpositions = model.means.cpu().numpy()
+            origpositions[:, [0, 1]] = origpositions[:, [1, 0]]
+            mean_origpositions = np.mean(origpositions, axis=0)
+            origpositions = origpositions + mean_origpositions
+            print(mean_origpositions)
+            positions = np.ndarray(shape=(0,3), dtype=float)
+            indices = []
+            i=0
+            pruningstart = time.time()
+            prun_rad = 0.5
+            for pos in origpositions:
+                if not (any(pos > prun_rad) or any(pos < -prun_rad)):
+                    positions = np.append(positions, [pos], axis=0)
+                    indices.append(i)
+                i += 1
+            pruningend = time.time()
+            print(f"Pruning time: {pruningend - pruningstart}")
+            n= positions.shape[0]
+            print(f"Total Gaussian Splats: {origpositions.shape[0]}, Pruned Gaussian Splats: {n}")
+            map_to_tensors["positions"] = positions
+            map_to_tensors["normals"] = np.zeros_like(positions, dtype=np.float32)
+
+
+            if model.config.sh_degree > 0:
+                shs_0 = model.shs_0.contiguous().cpu().numpy()
+                shs_0 = np.array([shs_0[i] for i in indices])
+                for i in range(shs_0.shape[1]):
+                    map_to_tensors[f"f_dc_{i}"] = shs_0[:, i, None]
+
+                # transpose(1, 2) was needed to match the sh order in Inria version
+                shs_rest = model.shs_rest.transpose(1, 2).contiguous().cpu().numpy()
+                shs_rest = np.array([shs_rest[i] for i in indices])
+                shs_rest = shs_rest.reshape((n, -1))
+                for i in range(shs_rest.shape[-1]):
+                    map_to_tensors[f"f_rest_{i}"] = shs_rest[:, i, None]
+            else:
+                colors = torch.clamp(model.colors.clone(), 0.0, 1.0).data.cpu().numpy()
+                colors = np.array([colors[i] for i in indices])
+                map_to_tensors["colors"] = (colors * 255).astype(np.uint8)
+
+            opacity = model.opacities.data.cpu().numpy()
+            opacity = np.array([opacity[i] for i in indices])
+            map_to_tensors["opacity"] = opacity
+
+            scales = model.scales.data.cpu().numpy()
+            scales = np.array([scales[i] for i in indices])
+            for i in range(3):
+                map_to_tensors[f"scale_{i}"] = scales[:, i, None]
+
+            quats = model.quats.data.cpu().numpy()
+            quats = np.array([quats[i] for i in indices])
+            for i in range(4):
+                map_to_tensors[f"rot_{i}"] = quats[:, i, None]
+
+        # post optimization, it is possible have NaN/Inf values in some attributes
+        # to ensure the exported ply file has finite values, we enforce finite filters.
+        select = np.ones(n, dtype=bool)
+        for k, t in map_to_tensors.items():
+            n_before = np.sum(select)
+            select = np.logical_and(select, np.isfinite(t).all(axis=1))
+            n_after = np.sum(select)
+            if n_after < n_before:
+                CONSOLE.print(f"{n_before - n_after} NaN/Inf elements in {k}")
+
+        if np.sum(select) < n:
+            CONSOLE.print(f"values have NaN/Inf in map_to_tensors, only export {np.sum(select)}/{n}")
+            for k, t in map_to_tensors.items():
+                map_to_tensors[k] = map_to_tensors[k][select, :]
+
+        pcd = o3d.t.geometry.PointCloud(map_to_tensors)
 
         # # Define the query point and radius
         # query_point = np.array([0, 0, 0])  # Change this to your actual query point
@@ -573,9 +672,124 @@ class ExportGaussianSplat(Exporter):
 
         o3d.t.io.write_point_cloud(str(filename), pcd,write_ascii=True)
         o3d.t.io.write_point_cloud(str(filename_bin), pcd)
-        # o3d.t.io.write_point_cloud(str(self.output_dir / "splat_pruned.ply"), pcd2,write_ascii=True)
-        # o3d.t.io.write_point_cloud(str(self.output_dir / "splat_pruned_bin.ply"), pcd2)
 
+
+@dataclass
+class ExportGaussianSplat_source(Exporter):
+    """
+    Export 3D Gaussian Splatting model to a .ply
+    """
+
+    @staticmethod
+    def write_ply(filename: str, count: int, map_to_tensors: OrderedDict[str, np.ndarray]):
+        """
+        Writes a PLY file with given vertex properties and their float values in the order specified by the OrderedDict.
+        Note: All float values will be converted to float32 for writing.
+
+        Parameters:
+        filename (str): The name of the file to write.
+        count (int): The number of vertices to write.
+        map_to_tensors (OrderedDict[str, np.ndarray]): An ordered dictionary mapping property names to numpy arrays of float values.
+            Each array should be 1-dimensional and of equal length matching 'count'. Arrays should not be empty.
+        """
+
+        # Ensure count matches the length of all tensors
+        if not all(len(tensor) == count for tensor in map_to_tensors.values()):
+            raise ValueError("Count does not match the length of all tensors")
+
+        # Type check for numpy arrays of type float and non-empty
+        if not all(
+            isinstance(tensor, np.ndarray) and tensor.dtype.kind in ["f", "d"] and tensor.size > 0
+            for tensor in map_to_tensors.values()
+        ):
+            raise ValueError("All tensors must be numpy arrays of float type and not empty")
+
+        with open(filename, "wb") as ply_file:
+            # Write PLY header
+            ply_file.write(b"ply\n")
+            ply_file.write(b"format binary_little_endian 1.0\n")
+
+            ply_file.write(f"element vertex {count}\n".encode())
+
+            # Write properties, in order due to OrderedDict
+            for key in map_to_tensors.keys():
+                ply_file.write(f"property float {key}\n".encode())
+
+            ply_file.write(b"end_header\n")
+
+            # Write binary data
+            # Note: If this is a perfromance bottleneck consider using numpy.hstack for efficiency improvement
+            for i in range(count):
+                for tensor in map_to_tensors.values():
+                    value = tensor[i]
+                    ply_file.write(np.float32(value).tobytes())
+
+    def main(self) -> None:
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+
+        _, pipeline, _, _ = eval_setup(self.load_config)
+
+        assert isinstance(pipeline.model, SplatfactoModel)
+
+        model: SplatfactoModel = pipeline.model
+
+        filename = self.output_dir / "splat.ply"
+
+        count = 0
+        map_to_tensors = OrderedDict()
+
+        with torch.no_grad():
+            positions = model.means.cpu().numpy()
+            count = positions.shape[0]
+            n = count
+            map_to_tensors["x"] = positions[:, 0]
+            map_to_tensors["y"] = positions[:, 1]
+            map_to_tensors["z"] = positions[:, 2]
+            map_to_tensors["nx"] = np.zeros(n, dtype=np.float32)
+            map_to_tensors["ny"] = np.zeros(n, dtype=np.float32)
+            map_to_tensors["nz"] = np.zeros(n, dtype=np.float32)
+
+            if model.config.sh_degree > 0:
+                shs_0 = model.shs_0.contiguous().cpu().numpy()
+                for i in range(shs_0.shape[1]):
+                    map_to_tensors[f"f_dc_{i}"] = shs_0[:, i, None]
+
+                # transpose(1, 2) was needed to match the sh order in Inria version
+                shs_rest = model.shs_rest.transpose(1, 2).contiguous().cpu().numpy()
+                shs_rest = shs_rest.reshape((n, -1))
+                for i in range(shs_rest.shape[-1]):
+                    map_to_tensors[f"f_rest_{i}"] = shs_rest[:, i, None]
+            else:
+                colors = torch.clamp(model.colors.clone(), 0.0, 1.0).data.cpu().numpy()
+                map_to_tensors["colors"] = (colors * 255).astype(np.uint8)
+
+            map_to_tensors["opacity"] = model.opacities.data.cpu().numpy()
+
+            scales = model.scales.data.cpu().numpy()
+            for i in range(3):
+                map_to_tensors[f"scale_{i}"] = scales[:, i, None]
+
+            quats = model.quats.data.cpu().numpy()
+            for i in range(4):
+                map_to_tensors[f"rot_{i}"] = quats[:, i, None]
+
+        # post optimization, it is possible have NaN/Inf values in some attributes
+        # to ensure the exported ply file has finite values, we enforce finite filters.
+        select = np.ones(n, dtype=bool)
+        for k, t in map_to_tensors.items():
+            n_before = np.sum(select)
+            select = np.logical_and(select, np.isfinite(t).all(axis=-1))
+            n_after = np.sum(select)
+            if n_after < n_before:
+                CONSOLE.print(f"{n_before - n_after} NaN/Inf elements in {k}")
+
+        if np.sum(select) < n:
+            CONSOLE.print(f"values have NaN/Inf in map_to_tensors, only export {np.sum(select)}/{n}")
+            for k, t in map_to_tensors.items():
+                map_to_tensors[k] = map_to_tensors[k][select]
+            count = np.sum(select)
+        self.write_ply(str(filename), count, map_to_tensors)
 
 Commands = tyro.conf.FlagConversionOff[
     Union[
@@ -584,7 +798,9 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[ExportPoissonMesh, tyro.conf.subcommand(name="poisson")],
         Annotated[ExportMarchingCubesMesh, tyro.conf.subcommand(name="marching-cubes")],
         Annotated[ExportCameraPoses, tyro.conf.subcommand(name="cameras")],
-        Annotated[ExportGaussianSplat, tyro.conf.subcommand(name="gaussian-splat")],
+        Annotated[ExportGaussianSplat, tyro.conf.subcommand(name="gaussiansplat")],
+        Annotated[ExportGaussianSplat_pointpruning, tyro.conf.subcommand(name="gaussiansplat-mini")],
+        Annotated[ExportGaussianSplat_source, tyro.conf.subcommand(name="gaussiansplat-source")],
     ]
 ]
 
