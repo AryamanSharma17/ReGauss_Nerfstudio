@@ -38,22 +38,21 @@ from nerfstudio.utils.writer import GLOBAL_BUFFER, EventName
 from nerfstudio.viewer_legacy.server import viewer_utils
 from nerfstudio.viewer_legacy.server.control_panel import ControlPanel
 from nerfstudio.viewer_legacy.server.gui_utils import parse_object
-from nerfstudio.viewer_legacy.server.render_state_machine import (
-    RenderAction, RenderStateMachine)
-from nerfstudio.viewer_legacy.server.utils import \
-    get_intrinsics_matrix_and_camera_to_world_h
-from nerfstudio.viewer_legacy.server.viewer_elements import (ViewerControl,
-                                                             ViewerElement)
+from nerfstudio.viewer_legacy.server.render_state_machine import RenderAction, RenderStateMachine
+from nerfstudio.viewer_legacy.server.utils import get_intrinsics_matrix_and_camera_to_world_h
+from nerfstudio.viewer_legacy.server.viewer_elements import ViewerControl, ViewerElement
 from nerfstudio.viewer_legacy.viser import ViserServer
-from nerfstudio.viewer_legacy.viser.messages import (CameraMessage,
-                                                     CameraPathOptionsRequest,
-                                                     CameraPathPayloadMessage,
-                                                     ClickMessage,
-                                                     CropParamsMessage,
-                                                     NerfstudioMessage,
-                                                     SaveCheckpointMessage,
-                                                     TimeConditionMessage,
-                                                     TrainingStateMessage)
+from nerfstudio.viewer_legacy.viser.messages import (
+    CameraMessage,
+    CameraPathOptionsRequest,
+    CameraPathPayloadMessage,
+    ClickMessage,
+    CropParamsMessage,
+    NerfstudioMessage,
+    SaveCheckpointMessage,
+    TimeConditionMessage,
+    TrainingStateMessage,
+)
 
 if TYPE_CHECKING:
     from nerfstudio.engine.trainer import Trainer
