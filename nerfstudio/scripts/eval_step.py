@@ -41,6 +41,7 @@ class ComputePSNR:
     step_num: int
     # Optional path to save rendered outputs to.
     render_output_path: Optional[Path] = None
+
     def main(self) -> None:
         """Main function."""
         config, pipeline, checkpoint_path, _ = eval_setup_step(self.load_config, self.step_num)

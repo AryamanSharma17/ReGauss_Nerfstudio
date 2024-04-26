@@ -48,7 +48,7 @@ from nerfstudio.exporter.exporter_utils import (
 )
 from nerfstudio.exporter.marching_cubes import generate_mesh_with_multires_marching_cubes
 from nerfstudio.fields.sdf_field import SDFField  # noqa
-from nerfstudio.models.splatfacto import SplatfactoModel
+from nerfstudio.models.splatfacto import SH2RGB, SplatfactoModel
 from nerfstudio.pipelines.base_pipeline import Pipeline, VanillaPipeline
 from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE
@@ -585,9 +585,9 @@ class ExportGaussianSplat(Exporter):
 
 
 @dataclass
-class ExportGaussianSplat_densitypruning(Exporter):
+class ExportGaussianSplat_pcd(Exporter):
     """
-    Export pruned by density 3D Gaussian Splatting model to a .ply
+    Export 3D Gaussian Splatting model with colors instead of SH to a .ply
     """
 
     def main(self) -> None:
@@ -599,41 +599,50 @@ class ExportGaussianSplat_densitypruning(Exporter):
         assert isinstance(pipeline.model, SplatfactoModel)
 
         model: SplatfactoModel = pipeline.model
+        model.config.use_scale_regularization = True
 
         filename_bin = self.output_dir / "splat_bin.ply"
-        filename = self.output_dir / "splat.ply"
+        filename = self.output_dir / "sparse_pc.ply"
 
         map_to_tensors = {}
 
         with torch.no_grad():
-            positions = model.means.cpu().numpy()
+            origpositions = model.means.cpu().numpy()
+            mean_origpositions = np.mean(origpositions, axis=0)
+            positions = np.ndarray(shape=(0, 3), dtype=float)
+            positions_list = []
+            indices = []
+            i = 0
+            print("Converting to point cloud")
+            print(f"Experiment date and time: {datetime.datetime.now()}")
+            prun_rad = 0.4
+            pruningstart = time.time()
+            for pos in origpositions:
+                if not (any(pos > prun_rad + mean_origpositions) or any(pos < -prun_rad + mean_origpositions)):
+                    positions_list.append(pos)
+                    indices.append(i)
+                i += 1
+            pruningend = time.time()
+            print(f"Pruning time: {pruningend - pruningstart}")
+            positions = np.array(positions_list)
             n = positions.shape[0]
+            print(f"Total Gaussian Splats: {origpositions.shape[0]}, Pruned Gaussian Splats: {n}")
             map_to_tensors["positions"] = positions
-            map_to_tensors["normals"] = np.zeros_like(positions, dtype=np.float32)
-
             if model.config.sh_degree > 0:
                 shs_0 = model.shs_0.contiguous().cpu().numpy()
-                for i in range(shs_0.shape[1]):
-                    map_to_tensors[f"f_dc_{i}"] = shs_0[:, i, None]
-
-                # transpose(1, 2) was needed to match the sh order in Inria version
-                shs_rest = model.shs_rest.transpose(1, 2).contiguous().cpu().numpy()
-                shs_rest = shs_rest.reshape((n, -1))
-                for i in range(shs_rest.shape[-1]):
-                    map_to_tensors[f"f_rest_{i}"] = shs_rest[:, i, None]
-            else:
-                colors = torch.clamp(model.colors.clone(), 0.0, 1.0).data.cpu().numpy()
-                map_to_tensors["colors"] = (colors * 255).astype(np.uint8)
-
-            map_to_tensors["opacity"] = model.opacities.data.cpu().numpy()
-
-            scales = model.scales.data.cpu().numpy()
-            for i in range(3):
-                map_to_tensors[f"scale_{i}"] = scales[:, i, None]
-
-            quats = model.quats.data.cpu().numpy()
-            for i in range(4):
-                map_to_tensors[f"rot_{i}"] = quats[:, i, None]
+                shs_0 = np.array([shs_0[i] for i in indices])
+                red = (SH2RGB(shs_0[:, 0, None]) * 255).astype(np.uint8)
+                if (red > 255).any():
+                    print("Red values out of range")
+                green = (SH2RGB(shs_0[:, 1, None]) * 255).astype(np.uint8)
+                if (green > 255).any():
+                    print("Green values out of range")
+                blue = (SH2RGB(shs_0[:, 2, None]) * 255).astype(np.uint8)
+                if (blue > 255).any():
+                    print("Blue values out of range")
+                map_to_tensors["red"] = green
+                map_to_tensors["green"] = red
+                map_to_tensors["blue"] = blue
 
         # post optimization, it is possible have NaN/Inf values in some attributes
         # to ensure the exported ply file has finite values, we enforce finite filters.
@@ -651,27 +660,6 @@ class ExportGaussianSplat_densitypruning(Exporter):
                 map_to_tensors[k] = map_to_tensors[k][select, :]
 
         pcd = o3d.t.geometry.PointCloud(map_to_tensors)
-
-        # # Define the query point and radius
-        # query_point = np.array([0, 0, 0])  # Change this to your actual query point
-        # radius = 1.0  # Change this to your actual radius
-
-        # # Filter the point cloud
-        # filtered_pcd = filter_points_within_radius(pcd, query_point, radius)
-
-        # # print(type(pcd))
-        # # with open(logfilename, 'w') as f:
-        # #     for position in map_to_tensors["positions"]:
-        # #         f.write(f"{position}\n")
-        # print(type(filtered_pcd))
-        # with open(logfilename, 'w') as f:
-        #     for position in np.asarray(filtered_pcd.points):
-        #         f.write(f"{position}\n")
-        # # for key,value in map_to_tensors.items():
-        # #     if isinstance(value, dict):  # If value is a dictionary, handle nested dictionary
-        # #         print(f"Number of elements in {key}: {len(value)}")
-        # #     else:  # Otherwise, it's a list
-        # #         print(f"Number of elements in {key}: {len(value)}")
 
         o3d.t.io.write_point_cloud(str(filename), pcd, write_ascii=True)
         o3d.t.io.write_point_cloud(str(filename_bin), pcd)
@@ -695,16 +683,12 @@ class ExportGaussianSplat_pointpruning(Exporter):
 
         filename_bin = self.output_dir / "splat_bin.ply"
         filename = self.output_dir / "splat.ply"
-        # logfilename = self.output_dir / "positions.log"
-        # indlogfilename = self.output_dir / "indpositions.log"
-        # prunedfilename = self.output_dir / "splat_pruned.log"
 
         map_to_tensors = {}
 
         with torch.no_grad():
             origpositions = model.means.cpu().numpy()
             mean_origpositions = np.mean(origpositions, axis=0)
-            print(mean_origpositions)
             positions = np.ndarray(shape=(0, 3), dtype=float)
             positions_list = []
             indices = []
@@ -906,7 +890,7 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[ExportGaussianSplat, tyro.conf.subcommand(name="gaussiansplat")],
         Annotated[ExportGaussianSplat_pointpruning, tyro.conf.subcommand(name="gaussiansplat-point")],
         Annotated[ExportGaussianSplat_source, tyro.conf.subcommand(name="gaussiansplat-source")],
-        Annotated[ExportGaussianSplat_densitypruning, tyro.conf.subcommand(name="gaussiansplat-density")],
+        Annotated[ExportGaussianSplat_pcd, tyro.conf.subcommand(name="gaussiansplat-pcd")],
     ]
 ]
 

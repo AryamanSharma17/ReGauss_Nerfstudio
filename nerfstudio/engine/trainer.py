@@ -445,6 +445,12 @@ class Trainer:
             },
             ckpt_path,
         )
+        parent_dir = self.checkpoint_dir.parent
+        log_file = parent_dir / "training_log.txt"
+        with open(log_file, "a") as f:
+            splats = len(self.pipeline._model.gauss_params.means)
+            f.write(f"Step: {step}      ")
+            f.write(f"Number of Splats: {splats}\n")
         # possibly delete old checkpoints
         if self.config.save_only_latest_checkpoint:
             # delete everything else in the checkpoint folder

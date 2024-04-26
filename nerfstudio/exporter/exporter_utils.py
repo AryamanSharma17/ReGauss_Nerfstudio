@@ -358,7 +358,7 @@ def collect_camera_poses_for_dataset_retrain(dataset: Optional[InputDataset]) ->
             {
                 "file_path": str(image_filename).replace("colmap/", ""),
                 "transform_matrix": transform,
-                "colmap_im_id": idx + 1,
+                "colmap_im_id": int((image_filename.stem).replace("frame_", "")),
             }
         )
 
