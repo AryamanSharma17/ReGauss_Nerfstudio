@@ -19,6 +19,7 @@ Script for exporting NeRF into other formats.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import sys
@@ -36,15 +37,16 @@ from typing_extensions import Annotated, Literal
 
 from nerfstudio.cameras.rays import RayBundle
 from nerfstudio.data.datamanagers.base_datamanager import VanillaDataManager
-from nerfstudio.data.datamanagers.parallel_datamanager import \
-    ParallelDataManager
+from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManager
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.exporter import texture_utils, tsdf_utils
-from nerfstudio.exporter.exporter_utils import (collect_camera_poses,
-                                                generate_point_cloud,
-                                                get_mesh_from_filename)
-from nerfstudio.exporter.marching_cubes import \
-    generate_mesh_with_multires_marching_cubes
+from nerfstudio.exporter.exporter_utils import (
+    collect_camera_poses,
+    collect_camera_poses_retrain,
+    generate_point_cloud,
+    get_mesh_from_filename,
+)
+from nerfstudio.exporter.marching_cubes import generate_mesh_with_multires_marching_cubes
 from nerfstudio.fields.sdf_field import SDFField  # noqa
 from nerfstudio.models.splatfacto import SplatfactoModel
 from nerfstudio.pipelines.base_pipeline import Pipeline, VanillaPipeline
@@ -483,9 +485,38 @@ class ExportCameraPoses(Exporter):
 
 
 @dataclass
+class ExportCameraPoses_mix(Exporter):
+    """
+    Export mixed camera poses to a .json file.
+    """
+
+    def main(self) -> None:
+        """Export camera poses"""
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+
+        _, pipeline, _, _ = eval_setup(self.load_config)
+        assert isinstance(pipeline, VanillaPipeline)
+        train_frames, eval_frames = collect_camera_poses_retrain(pipeline)
+        final_frames = train_frames + eval_frames
+
+        for file_name, frames in [("transforms.json", final_frames)]:
+            if len(frames) == 0:
+                CONSOLE.print(f"[bold yellow]No frames found for {file_name}. Skipping.")
+                continue
+
+            output_file_path = os.path.join(self.output_dir, file_name)
+
+            with open(output_file_path, "w", encoding="UTF-8") as f:
+                json.dump(frames, f, indent=4)
+
+            CONSOLE.print(f"[bold green]:white_check_mark: Saved poses to {output_file_path}")
+
+
+@dataclass
 class ExportGaussianSplat(Exporter):
     """
-    Export 3D Gaussian Splatting model to a .ply
+    Export stable 3D Gaussian Splatting model to a .ply
     """
 
     def main(self) -> None:
@@ -549,13 +580,14 @@ class ExportGaussianSplat(Exporter):
                 map_to_tensors[k] = map_to_tensors[k][select, :]
 
         pcd = o3d.t.geometry.PointCloud(map_to_tensors)
-        o3d.t.io.write_point_cloud(str(filename), pcd,write_ascii=True)
+        o3d.t.io.write_point_cloud(str(filename), pcd, write_ascii=True)
         o3d.t.io.write_point_cloud(str(filename_bin), pcd)
 
+
 @dataclass
-class ExportGaussianSplat_pointpruning(Exporter):
+class ExportGaussianSplat_densitypruning(Exporter):
     """
-    Export 3D Gaussian Splatting model to a .ply
+    Export pruned by density 3D Gaussian Splatting model to a .ply
     """
 
     def main(self) -> None:
@@ -567,7 +599,100 @@ class ExportGaussianSplat_pointpruning(Exporter):
         assert isinstance(pipeline.model, SplatfactoModel)
 
         model: SplatfactoModel = pipeline.model
-        
+
+        filename_bin = self.output_dir / "splat_bin.ply"
+        filename = self.output_dir / "splat.ply"
+
+        map_to_tensors = {}
+
+        with torch.no_grad():
+            positions = model.means.cpu().numpy()
+            n = positions.shape[0]
+            map_to_tensors["positions"] = positions
+            map_to_tensors["normals"] = np.zeros_like(positions, dtype=np.float32)
+
+            if model.config.sh_degree > 0:
+                shs_0 = model.shs_0.contiguous().cpu().numpy()
+                for i in range(shs_0.shape[1]):
+                    map_to_tensors[f"f_dc_{i}"] = shs_0[:, i, None]
+
+                # transpose(1, 2) was needed to match the sh order in Inria version
+                shs_rest = model.shs_rest.transpose(1, 2).contiguous().cpu().numpy()
+                shs_rest = shs_rest.reshape((n, -1))
+                for i in range(shs_rest.shape[-1]):
+                    map_to_tensors[f"f_rest_{i}"] = shs_rest[:, i, None]
+            else:
+                colors = torch.clamp(model.colors.clone(), 0.0, 1.0).data.cpu().numpy()
+                map_to_tensors["colors"] = (colors * 255).astype(np.uint8)
+
+            map_to_tensors["opacity"] = model.opacities.data.cpu().numpy()
+
+            scales = model.scales.data.cpu().numpy()
+            for i in range(3):
+                map_to_tensors[f"scale_{i}"] = scales[:, i, None]
+
+            quats = model.quats.data.cpu().numpy()
+            for i in range(4):
+                map_to_tensors[f"rot_{i}"] = quats[:, i, None]
+
+        # post optimization, it is possible have NaN/Inf values in some attributes
+        # to ensure the exported ply file has finite values, we enforce finite filters.
+        select = np.ones(n, dtype=bool)
+        for k, t in map_to_tensors.items():
+            n_before = np.sum(select)
+            select = np.logical_and(select, np.isfinite(t).all(axis=1))
+            n_after = np.sum(select)
+            if n_after < n_before:
+                CONSOLE.print(f"{n_before - n_after} NaN/Inf elements in {k}")
+
+        if np.sum(select) < n:
+            CONSOLE.print(f"values have NaN/Inf in map_to_tensors, only export {np.sum(select)}/{n}")
+            for k, t in map_to_tensors.items():
+                map_to_tensors[k] = map_to_tensors[k][select, :]
+
+        pcd = o3d.t.geometry.PointCloud(map_to_tensors)
+
+        # # Define the query point and radius
+        # query_point = np.array([0, 0, 0])  # Change this to your actual query point
+        # radius = 1.0  # Change this to your actual radius
+
+        # # Filter the point cloud
+        # filtered_pcd = filter_points_within_radius(pcd, query_point, radius)
+
+        # # print(type(pcd))
+        # # with open(logfilename, 'w') as f:
+        # #     for position in map_to_tensors["positions"]:
+        # #         f.write(f"{position}\n")
+        # print(type(filtered_pcd))
+        # with open(logfilename, 'w') as f:
+        #     for position in np.asarray(filtered_pcd.points):
+        #         f.write(f"{position}\n")
+        # # for key,value in map_to_tensors.items():
+        # #     if isinstance(value, dict):  # If value is a dictionary, handle nested dictionary
+        # #         print(f"Number of elements in {key}: {len(value)}")
+        # #     else:  # Otherwise, it's a list
+        # #         print(f"Number of elements in {key}: {len(value)}")
+
+        o3d.t.io.write_point_cloud(str(filename), pcd, write_ascii=True)
+        o3d.t.io.write_point_cloud(str(filename_bin), pcd)
+
+
+@dataclass
+class ExportGaussianSplat_pointpruning(Exporter):
+    """
+    Export pruned by geometry 3D Gaussian Splatting model to a .ply
+    """
+
+    def main(self) -> None:
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+
+        _, pipeline, _, _ = eval_setup(self.load_config)
+
+        assert isinstance(pipeline.model, SplatfactoModel)
+
+        model: SplatfactoModel = pipeline.model
+
         filename_bin = self.output_dir / "splat_bin.ply"
         filename = self.output_dir / "splat.ply"
         # logfilename = self.output_dir / "positions.log"
@@ -578,27 +703,27 @@ class ExportGaussianSplat_pointpruning(Exporter):
 
         with torch.no_grad():
             origpositions = model.means.cpu().numpy()
-            origpositions[:, [0, 1]] = origpositions[:, [1, 0]]
             mean_origpositions = np.mean(origpositions, axis=0)
-            origpositions = origpositions + mean_origpositions
             print(mean_origpositions)
-            positions = np.ndarray(shape=(0,3), dtype=float)
+            positions = np.ndarray(shape=(0, 3), dtype=float)
+            positions_list = []
             indices = []
-            i=0
+            i = 0
+            print(f"Experiment date and time: {datetime.datetime.now()}")
+            prun_rad = 0.4
             pruningstart = time.time()
-            prun_rad = 0.5
             for pos in origpositions:
-                if not (any(pos > prun_rad) or any(pos < -prun_rad)):
-                    positions = np.append(positions, [pos], axis=0)
+                if not (any(pos > prun_rad + mean_origpositions) or any(pos < -prun_rad + mean_origpositions)):
+                    positions_list.append(pos)
                     indices.append(i)
                 i += 1
             pruningend = time.time()
             print(f"Pruning time: {pruningend - pruningstart}")
-            n= positions.shape[0]
+            positions = np.array(positions_list)
+            n = positions.shape[0]
             print(f"Total Gaussian Splats: {origpositions.shape[0]}, Pruned Gaussian Splats: {n}")
             map_to_tensors["positions"] = positions
             map_to_tensors["normals"] = np.zeros_like(positions, dtype=np.float32)
-
 
             if model.config.sh_degree > 0:
                 shs_0 = model.shs_0.contiguous().cpu().numpy()
@@ -648,36 +773,14 @@ class ExportGaussianSplat_pointpruning(Exporter):
 
         pcd = o3d.t.geometry.PointCloud(map_to_tensors)
 
-        # # Define the query point and radius
-        # query_point = np.array([0, 0, 0])  # Change this to your actual query point
-        # radius = 1.0  # Change this to your actual radius
-
-        # # Filter the point cloud
-        # filtered_pcd = filter_points_within_radius(pcd, query_point, radius)
-        
-        # # print(type(pcd))
-        # # with open(logfilename, 'w') as f:
-        # #     for position in map_to_tensors["positions"]:
-        # #         f.write(f"{position}\n")
-        # print(type(filtered_pcd))
-        # with open(logfilename, 'w') as f:
-        #     for position in np.asarray(filtered_pcd.points):
-        #         f.write(f"{position}\n")
-        # # for key,value in map_to_tensors.items():
-        # #     if isinstance(value, dict):  # If value is a dictionary, handle nested dictionary
-        # #         print(f"Number of elements in {key}: {len(value)}")
-        # #     else:  # Otherwise, it's a list
-        # #         print(f"Number of elements in {key}: {len(value)}")
-        
-
-        o3d.t.io.write_point_cloud(str(filename), pcd,write_ascii=True)
+        o3d.t.io.write_point_cloud(str(filename), pcd, write_ascii=True)
         o3d.t.io.write_point_cloud(str(filename_bin), pcd)
 
 
 @dataclass
 class ExportGaussianSplat_source(Exporter):
     """
-    Export 3D Gaussian Splatting model to a .ply
+    Export nerfstudio latest 3D Gaussian Splatting model to a .ply
     """
 
     @staticmethod
@@ -791,6 +894,7 @@ class ExportGaussianSplat_source(Exporter):
             count = np.sum(select)
         self.write_ply(str(filename), count, map_to_tensors)
 
+
 Commands = tyro.conf.FlagConversionOff[
     Union[
         Annotated[ExportPointCloud, tyro.conf.subcommand(name="pointcloud")],
@@ -798,9 +902,11 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[ExportPoissonMesh, tyro.conf.subcommand(name="poisson")],
         Annotated[ExportMarchingCubesMesh, tyro.conf.subcommand(name="marching-cubes")],
         Annotated[ExportCameraPoses, tyro.conf.subcommand(name="cameras")],
+        Annotated[ExportCameraPoses_mix, tyro.conf.subcommand(name="cameras-mix")],
         Annotated[ExportGaussianSplat, tyro.conf.subcommand(name="gaussiansplat")],
-        Annotated[ExportGaussianSplat_pointpruning, tyro.conf.subcommand(name="gaussiansplat-mini")],
+        Annotated[ExportGaussianSplat_pointpruning, tyro.conf.subcommand(name="gaussiansplat-point")],
         Annotated[ExportGaussianSplat_source, tyro.conf.subcommand(name="gaussiansplat-source")],
+        Annotated[ExportGaussianSplat_densitypruning, tyro.conf.subcommand(name="gaussiansplat-density")],
     ]
 ]
 
