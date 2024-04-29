@@ -111,7 +111,10 @@ def eval_setup(
 
     return config, pipeline, checkpoint_path, step
 
-def eval_load_checkpoint_step(config: TrainerConfig, pipeline: Pipeline, step_num: Optional[int]) -> Tuple[Path, Optional[int]]:
+
+def eval_load_checkpoint_step(
+    config: TrainerConfig, pipeline: Pipeline, step_num: Optional[int]
+) -> Tuple[Path, Optional[int]]:
     ## TODO: ideally eventually want to get this to be the same as whatever is used to load train checkpoint too
     """Helper function to load checkpointed pipeline
 
@@ -130,9 +133,10 @@ def eval_load_checkpoint_step(config: TrainerConfig, pipeline: Pipeline, step_nu
     CONSOLE.print(f":white_check_mark: Done loading checkpoint from {load_path}")
     return load_path, load_step
 
+
 def eval_setup_step(
     config_path: Path,
-    step_num: int|None,
+    step_num: int | None,
     eval_num_rays_per_chunk: Optional[int] = None,
     test_mode: Literal["test", "val", "inference"] = "test",
     update_config_callback: Optional[Callable[[TrainerConfig], TrainerConfig]] = None,

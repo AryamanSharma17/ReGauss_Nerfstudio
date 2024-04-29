@@ -38,7 +38,7 @@ class ComputePSNR:
     # Name of the output file.
     output_path: Path
     # Step number to load.
-    step_num:int
+    step_num: int
     # Flag to see if only the latest checkpoint to be loaded (True if yes)
     flag: bool
     # Optional path to save rendered outputs to.
