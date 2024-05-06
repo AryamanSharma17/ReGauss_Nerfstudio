@@ -39,7 +39,7 @@ TCNN_EXISTS = False
 tcnn_import_exception = None
 tcnn = None
 try:
-    import tinycudann
+    import tinycudann  # type: ignore
 
     tcnn = tinycudann
     del tinycudann
