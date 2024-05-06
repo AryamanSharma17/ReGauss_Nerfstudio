@@ -626,23 +626,21 @@ class ExportGaussianSplat_pcd(Exporter):
             print(f"Pruning time: {pruningend - pruningstart}")
             positions = np.array(positions_list)
             n = positions.shape[0]
-            print(f"Total Gaussian Splats: {origpositions.shape[0]}, Pruned Gaussian Splats: {n}")
+            print(f"Total Gaussian Splats: {origpositions.shape[0]}, Remaining Gaussian Splats: {n}")
             map_to_tensors["positions"] = positions
             if model.config.sh_degree > 0:
                 shs_0 = model.shs_0.contiguous().cpu().numpy()
                 shs_0 = np.array([shs_0[i] for i in indices])
-                red = (SH2RGB(shs_0[:, 0, None]) * 255).astype(np.uint8)
-                if (red > 255).any():
-                    print("Red values out of range")
-                green = (SH2RGB(shs_0[:, 1, None]) * 255).astype(np.uint8)
-                if (green > 255).any():
-                    print("Green values out of range")
-                blue = (SH2RGB(shs_0[:, 2, None]) * 255).astype(np.uint8)
-                if (blue > 255).any():
-                    print("Blue values out of range")
-                map_to_tensors["red"] = green
-                map_to_tensors["green"] = red
-                map_to_tensors["blue"] = blue
+                red = np.clip(np.abs(SH2RGB(shs_0[:, 0, None]) * 255), 0, 255).astype(np.uint8)
+                green = np.clip(np.abs(SH2RGB(shs_0[:, 1, None]) * 255), 0, 255).astype(np.uint8)
+                blue = np.clip(np.abs(SH2RGB(shs_0[:, 2, None]) * 255), 0, 255).astype(np.uint8)
+
+                print(np.max(red), np.max(green), np.max(blue))
+                print(np.min(red), np.min(green), np.min(blue))
+                # map_to_tensors["red"] = red
+                # map_to_tensors["green"] = green
+                # map_to_tensors["blue"] = blue
+                map_to_tensors["colors"] = np.concatenate([red, green, blue], axis=1)
 
         # post optimization, it is possible have NaN/Inf values in some attributes
         # to ensure the exported ply file has finite values, we enforce finite filters.
@@ -705,7 +703,7 @@ class ExportGaussianSplat_pointpruning(Exporter):
             print(f"Pruning time: {pruningend - pruningstart}")
             positions = np.array(positions_list)
             n = positions.shape[0]
-            print(f"Total Gaussian Splats: {origpositions.shape[0]}, Pruned Gaussian Splats: {n}")
+            print(f"Total Gaussian Splats: {origpositions.shape[0]}, Remaining Gaussian Splats: {n}")
             map_to_tensors["positions"] = positions
             map_to_tensors["normals"] = np.zeros_like(positions, dtype=np.float32)
 
