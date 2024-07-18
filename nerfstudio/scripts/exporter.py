@@ -19,9 +19,11 @@ Script for exporting NeRF into other formats.
 
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import sys
+import time
 import typing
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -32,6 +34,7 @@ import numpy as np
 import open3d as o3d
 import torch
 import tyro
+from plyfile import PlyData, PlyElement
 from typing_extensions import Annotated, Literal
 
 from nerfstudio.cameras.rays import RayBundle
@@ -41,10 +44,15 @@ from nerfstudio.data.datamanagers.parallel_datamanager import ParallelDataManage
 from nerfstudio.data.datamanagers.random_cameras_datamanager import RandomCamerasDataManager
 from nerfstudio.data.scene_box import OrientedBox
 from nerfstudio.exporter import texture_utils, tsdf_utils
-from nerfstudio.exporter.exporter_utils import collect_camera_poses, generate_point_cloud, get_mesh_from_filename
+from nerfstudio.exporter.exporter_utils import (
+    collect_camera_poses,
+    collect_camera_poses_retrain,
+    generate_point_cloud,
+    get_mesh_from_filename,
+)
 from nerfstudio.exporter.marching_cubes import generate_mesh_with_multires_marching_cubes
 from nerfstudio.fields.sdf_field import SDFField  # noqa
-from nerfstudio.models.splatfacto import SplatfactoModel
+from nerfstudio.models.splatfacto import SH2RGB, SplatfactoModel
 from nerfstudio.pipelines.base_pipeline import Pipeline, VanillaPipeline
 from nerfstudio.utils.eval_utils import eval_setup
 from nerfstudio.utils.rich_utils import CONSOLE
@@ -475,7 +483,361 @@ class ExportCameraPoses(Exporter):
 
 
 @dataclass
+class ExportCameraPoses_mix(Exporter):
+    """
+    Export mixed camera poses to a .json file.
+    """
+
+    def main(self) -> None:
+        """Export camera poses"""
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+
+        _, pipeline, _, _ = eval_setup(self.load_config)
+        assert isinstance(pipeline, VanillaPipeline)
+        train_frames, eval_frames = collect_camera_poses_retrain(pipeline)
+        final_frames = train_frames + eval_frames
+
+        for file_name, frames in [("transforms.json", final_frames)]:
+            if len(frames) == 0:
+                CONSOLE.print(f"[bold yellow]No frames found for {file_name}. Skipping.")
+                continue
+
+            output_file_path = os.path.join(self.output_dir, file_name)
+
+            with open(output_file_path, "w", encoding="UTF-8") as f:
+                json.dump(frames, f, indent=4)
+
+            CONSOLE.print(f"[bold green]:white_check_mark: Saved poses to {output_file_path}")
+
+
+@dataclass
 class ExportGaussianSplat(Exporter):
+    """
+    Export stable 3D Gaussian Splatting model to a .ply
+    """
+
+    def main(self) -> None:
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+
+        _, pipeline, _, _ = eval_setup(self.load_config)
+
+        assert isinstance(pipeline.model, SplatfactoModel)
+
+        model: SplatfactoModel = pipeline.model
+
+        filename_bin = self.output_dir / "splat_bin.ply"
+        filename = self.output_dir / "splat.ply"
+        with torch.no_grad():
+            xyz = model.means.detach().cpu().numpy()
+            normals = np.zeros_like(xyz)
+            f_dc = model.shs_0.detach().flatten(start_dim=1).contiguous().cpu().numpy()
+            f_rest = model.shs_rest.detach().transpose(1, 2).flatten(start_dim=1).contiguous().cpu().numpy()
+            opacities = model.opacities.detach().cpu().numpy()
+            scale = model.scales.detach().cpu().numpy()
+            rotation = model.quats.detach().cpu().numpy()
+
+        dtype_full = [(attribute, "f4") for attribute in construct_list_of_attributes(self, model)]
+
+        elements = np.empty(xyz.shape[0], dtype=dtype_full)
+        attributes = np.concatenate((xyz, normals, f_dc, f_rest, opacities, scale, rotation), axis=1)
+        elements[:] = list(map(tuple, attributes))
+        el = PlyElement.describe(elements, "vertex")
+        PlyData([el]).write(filename_bin)
+        PlyData([el], text=True).write(filename)
+
+
+def construct_list_of_attributes(self, model):
+    l = ["x", "y", "z", "nx", "ny", "nz"]
+    # All channels except the 3 DC
+    for i in range(model.shs_0.shape[1]):
+        l.append("f_dc_{}".format(i))
+    for i in range(model.shs_rest.shape[1] * model.shs_rest.shape[2]):
+        l.append("f_rest_{}".format(i))
+    l.append("opacity")
+    for i in range(model.scales.shape[1]):
+        l.append("scale_{}".format(i))
+    for i in range(model.quats.shape[1]):
+        l.append("rot_{}".format(i))
+    return l
+
+
+@dataclass
+class ExportGaussianlog(Exporter):
+    """
+    Export Gaussian parameters to a .npy file
+    """
+
+    def main(self) -> None:
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+
+        _, pipeline, _, _ = eval_setup(self.load_config)
+
+        assert isinstance(pipeline.model, SplatfactoModel)
+
+        model: SplatfactoModel = pipeline.model
+
+        with torch.no_grad():
+            positions = model.means.cpu().numpy()
+            np.save(self.output_dir / "means.npy", np.around(positions, decimals=5))
+            print("Done means")
+
+            if model.config.sh_degree > 0:
+                shs_0 = model.shs_0.contiguous().cpu().numpy()
+                red = np.clip(np.abs(SH2RGB(shs_0[:, 0, None]) * 255), 0, 255).astype(np.uint8)
+                green = np.clip(np.abs(SH2RGB(shs_0[:, 1, None]) * 255), 0, 255).astype(np.uint8)
+                blue = np.clip(np.abs(SH2RGB(shs_0[:, 2, None]) * 255), 0, 255).astype(np.uint8)
+
+                np.save(self.output_dir / "colors.npy", np.concatenate([red, green, blue], axis=1))
+                print("Done colors")
+
+                np.save(self.output_dir / "features_dc.npy", np.around(shs_0, decimals=5))
+                print("Done features_dc")
+
+                shs_rest = model.shs_rest.contiguous().cpu().numpy()
+                np.save(self.output_dir / "features_rest.npy", np.around(shs_rest, decimals=5))
+                print("Done features_rest")
+
+            opacity = model.opacities.data.cpu().numpy()
+            np.save(self.output_dir / "opacity.npy", np.around(opacity, decimals=5))
+            print("Done opacity")
+
+            scales = model.scales.data.cpu().numpy()
+            np.save(self.output_dir / "scales.npy", np.around(scales, decimals=5))
+            print("Done scales")
+
+            quats = model.quats.data.cpu().numpy()
+            np.save(self.output_dir / "quats.npy", np.around(quats, decimals=5))
+            print("Done quats")
+
+
+@dataclass
+class ExportGaussianSplat_pcd(Exporter):
+    """
+    Export 3D Gaussian Splatting model with colors instead of SH to a .ply
+    """
+
+    def main(self) -> None:
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+
+        _, pipeline, _, _ = eval_setup(self.load_config)
+
+        assert isinstance(pipeline.model, SplatfactoModel)
+
+        model: SplatfactoModel = pipeline.model
+        model.config.use_scale_regularization = True
+
+        filename_bin = self.output_dir / "splat_bin.ply"
+        filename = self.output_dir / "sparse_pc.ply"
+
+        map_to_tensors = {}
+
+        with torch.no_grad():
+            origpositions = model.means.cpu().numpy()
+            mean_origpositions = np.mean(origpositions, axis=0)
+            positions = np.ndarray(shape=(0, 3), dtype=float)
+            positions_list = []
+            indices = []
+            i = 0
+            print("Converting to point cloud")
+            print(f"Experiment date and time: {datetime.datetime.now()}")
+            prun_rad = 0.4
+            pruningstart = time.time()
+            for pos in origpositions:
+                if not (any(pos > prun_rad + mean_origpositions) or any(pos < -prun_rad + mean_origpositions)):
+                    positions_list.append(pos)
+                    indices.append(i)
+                i += 1
+            pruningend = time.time()
+            print(f"Pruning time: {pruningend - pruningstart}")
+            positions = np.array(positions_list)
+            n = positions.shape[0]
+            print(f"Total Gaussian Splats: {origpositions.shape[0]}, Remaining Gaussian Splats: {n}")
+            map_to_tensors["positions"] = positions
+            if model.config.sh_degree > 0:
+                shs_0 = model.shs_0.contiguous().cpu().numpy()
+                shs_0 = np.array([shs_0[i] for i in indices])
+                red = np.clip(np.abs(SH2RGB(shs_0[:, 0, None]) * 255), 0, 255).astype(np.uint8)
+                green = np.clip(np.abs(SH2RGB(shs_0[:, 1, None]) * 255), 0, 255).astype(np.uint8)
+                blue = np.clip(np.abs(SH2RGB(shs_0[:, 2, None]) * 255), 0, 255).astype(np.uint8)
+                map_to_tensors["colors"] = np.concatenate([red, green, blue], axis=1)
+
+        # post optimization, it is possible have NaN/Inf values in some attributes
+        # to ensure the exported ply file has finite values, we enforce finite filters.
+        select = np.ones(n, dtype=bool)
+        for k, t in map_to_tensors.items():
+            n_before = np.sum(select)
+            select = np.logical_and(select, np.isfinite(t).all(axis=1))
+            n_after = np.sum(select)
+            if n_after < n_before:
+                CONSOLE.print(f"{n_before - n_after} NaN/Inf elements in {k}")
+
+        if np.sum(select) < n:
+            CONSOLE.print(f"values have NaN/Inf in map_to_tensors, only export {np.sum(select)}/{n}")
+            for k, t in map_to_tensors.items():
+                map_to_tensors[k] = map_to_tensors[k][select, :]
+
+        pcd = o3d.t.geometry.PointCloud(map_to_tensors)
+
+        o3d.t.io.write_point_cloud(str(filename), pcd, write_ascii=True)
+        o3d.t.io.write_point_cloud(str(filename_bin), pcd)
+
+
+class ExportGaussianSplat_pcd_full(Exporter):
+    """
+    Export 3D Gaussian Splatting model with colors instead of SH to a .ply
+    """
+
+    def main(self) -> None:
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+
+        _, pipeline, _, _ = eval_setup(self.load_config)
+
+        assert isinstance(pipeline.model, SplatfactoModel)
+
+        model: SplatfactoModel = pipeline.model
+        model.config.use_scale_regularization = True
+
+        # filename_bin = self.output_dir / "splat_bin.ply"
+        filename = self.output_dir / "sparse_pc.ply"
+
+        map_to_tensors = {}
+
+        with torch.no_grad():
+            positions = model.means.cpu().numpy()
+            n = positions.shape[0]
+            map_to_tensors["positions"] = positions
+
+            if model.config.sh_degree > 0:
+                shs_0 = model.shs_0.contiguous().cpu().numpy()
+                red = np.clip(np.abs(SH2RGB(shs_0[:, 0, None]) * 255), 0, 255).astype(np.uint8)
+                green = np.clip(np.abs(SH2RGB(shs_0[:, 1, None]) * 255), 0, 255).astype(np.uint8)
+                blue = np.clip(np.abs(SH2RGB(shs_0[:, 2, None]) * 255), 0, 255).astype(np.uint8)
+                map_to_tensors["colors"] = np.concatenate([red, green, blue], axis=1)
+
+        # post optimization, it is possible have NaN/Inf values in some attributes
+        # to ensure the exported ply file has finite values, we enforce finite filters.
+        select = np.ones(n, dtype=bool)
+        for k, t in map_to_tensors.items():
+            n_before = np.sum(select)
+            select = np.logical_and(select, np.isfinite(t).all(axis=1))
+            n_after = np.sum(select)
+            if n_after < n_before:
+                CONSOLE.print(f"{n_before - n_after} NaN/Inf elements in {k}")
+
+        if np.sum(select) < n:
+            CONSOLE.print(f"values have NaN/Inf in map_to_tensors, only export {np.sum(select)}/{n}")
+            for k, t in map_to_tensors.items():
+                map_to_tensors[k] = map_to_tensors[k][select, :]
+
+        pcd = o3d.t.geometry.PointCloud(map_to_tensors)
+        # print(model.keys())
+
+        o3d.t.io.write_point_cloud(str(filename), pcd, write_ascii=True)
+
+
+@dataclass
+class ExportGaussianSplat_pointpruning(Exporter):
+    """
+    Export pruned by geometry 3D Gaussian Splatting model to a .ply
+    """
+
+    def main(self) -> None:
+        if not self.output_dir.exists():
+            self.output_dir.mkdir(parents=True)
+
+        _, pipeline, _, _ = eval_setup(self.load_config)
+
+        assert isinstance(pipeline.model, SplatfactoModel)
+
+        model: SplatfactoModel = pipeline.model
+
+        filename_bin = self.output_dir / "splat_bin.ply"
+        filename = self.output_dir / "splat.ply"
+
+        map_to_tensors = {}
+
+        with torch.no_grad():
+            origpositions = model.means.cpu().numpy()
+            mean_origpositions = np.mean(origpositions, axis=0)
+            positions = np.ndarray(shape=(0, 3), dtype=float)
+            positions_list = []
+            indices = []
+            i = 0
+            print(f"Experiment date and time: {datetime.datetime.now()}")
+            prun_rad = 0.4
+            pruningstart = time.time()
+            for pos in origpositions:
+                if not (any(pos > prun_rad + mean_origpositions) or any(pos < -prun_rad + mean_origpositions)):
+                    positions_list.append(pos)
+                    indices.append(i)
+                i += 1
+            pruningend = time.time()
+            print(f"Pruning time: {pruningend - pruningstart}")
+            positions = np.array(positions_list)
+            n = positions.shape[0]
+            print(f"Total Gaussian Splats: {origpositions.shape[0]}, Remaining Gaussian Splats: {n}")
+            map_to_tensors["positions"] = positions
+            map_to_tensors["normals"] = np.zeros_like(positions, dtype=np.float32)
+
+            if model.config.sh_degree > 0:
+                shs_0 = model.shs_0.contiguous().cpu().numpy()
+                shs_0 = np.array([shs_0[i] for i in indices])
+                for i in range(shs_0.shape[1]):
+                    map_to_tensors[f"f_dc_{i}"] = shs_0[:, i, None]
+
+                # transpose(1, 2) was needed to match the sh order in Inria version
+                shs_rest = model.shs_rest.transpose(1, 2).contiguous().cpu().numpy()
+                shs_rest = np.array([shs_rest[i] for i in indices])
+                shs_rest = shs_rest.reshape((n, -1))
+                for i in range(shs_rest.shape[-1]):
+                    map_to_tensors[f"f_rest_{i}"] = shs_rest[:, i, None]
+            else:
+                colors = torch.clamp(model.colors.clone(), 0.0, 1.0).data.cpu().numpy()
+                colors = np.array([colors[i] for i in indices])
+                map_to_tensors["colors"] = (colors * 255).astype(np.uint8)
+
+            opacity = model.opacities.data.cpu().numpy()
+            opacity = np.array([opacity[i] for i in indices])
+            map_to_tensors["opacity"] = opacity
+
+            scales = model.scales.data.cpu().numpy()
+            scales = np.array([scales[i] for i in indices])
+            for i in range(3):
+                map_to_tensors[f"scale_{i}"] = scales[:, i, None]
+
+            quats = model.quats.data.cpu().numpy()
+            quats = np.array([quats[i] for i in indices])
+            for i in range(4):
+                map_to_tensors[f"rot_{i}"] = quats[:, i, None]
+
+        # post optimization, it is possible have NaN/Inf values in some attributes
+        # to ensure the exported ply file has finite values, we enforce finite filters.
+        select = np.ones(n, dtype=bool)
+        for k, t in map_to_tensors.items():
+            n_before = np.sum(select)
+            select = np.logical_and(select, np.isfinite(t).all(axis=1))
+            n_after = np.sum(select)
+            if n_after < n_before:
+                CONSOLE.print(f"{n_before - n_after} NaN/Inf elements in {k}")
+
+        if np.sum(select) < n:
+            CONSOLE.print(f"values have NaN/Inf in map_to_tensors, only export {np.sum(select)}/{n}")
+            for k, t in map_to_tensors.items():
+                map_to_tensors[k] = map_to_tensors[k][select, :]
+
+        pcd = o3d.t.geometry.PointCloud(map_to_tensors)
+
+        o3d.t.io.write_point_cloud(str(filename), pcd, write_ascii=True)
+        o3d.t.io.write_point_cloud(str(filename_bin), pcd)
+
+
+@dataclass
+class ExportGaussianSplat_source(Exporter):
     """
     Export 3D Gaussian Splatting model to a .ply
     """
@@ -617,7 +979,7 @@ class ExportGaussianSplat(Exporter):
                 map_to_tensors[k] = map_to_tensors[k][select]
             count = np.sum(select)
 
-        ExportGaussianSplat.write_ply(str(filename), count, map_to_tensors)
+        ExportGaussianSplat_source.write_ply(str(filename), count, map_to_tensors)
 
 
 Commands = tyro.conf.FlagConversionOff[
@@ -627,7 +989,13 @@ Commands = tyro.conf.FlagConversionOff[
         Annotated[ExportPoissonMesh, tyro.conf.subcommand(name="poisson")],
         Annotated[ExportMarchingCubesMesh, tyro.conf.subcommand(name="marching-cubes")],
         Annotated[ExportCameraPoses, tyro.conf.subcommand(name="cameras")],
-        Annotated[ExportGaussianSplat, tyro.conf.subcommand(name="gaussian-splat")],
+        Annotated[ExportCameraPoses_mix, tyro.conf.subcommand(name="cameras-mix")],
+        Annotated[ExportGaussianSplat, tyro.conf.subcommand(name="gaussiansplat")],
+        Annotated[ExportGaussianSplat_pointpruning, tyro.conf.subcommand(name="gaussiansplat-point")],
+        Annotated[ExportGaussianSplat_source, tyro.conf.subcommand(name="gaussiansplat-source")],
+        Annotated[ExportGaussianSplat_pcd, tyro.conf.subcommand(name="gaussiansplat-pcd")],
+        Annotated[ExportGaussianSplat_pcd_full, tyro.conf.subcommand(name="gaussiansplat-pcd-full")],
+        Annotated[ExportGaussianlog, tyro.conf.subcommand(name="gaussiansplat-log")],
     ]
 ]
 

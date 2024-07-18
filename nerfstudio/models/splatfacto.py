@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Type, Union
 
 import numpy as np
@@ -165,6 +166,11 @@ class SplatfactoModelConfig(ModelConfig):
     camera_optimizer: CameraOptimizerConfig = field(default_factory=lambda: CameraOptimizerConfig(mode="off"))
     """Config of the camera optimizer to use"""
 
+    load_param_directory: Optional[Path] = None
+    """addendum: Path to Load Gaussian Paramters saved as npy file from another scene"""
+    flag_load_from_param: Optional[bool] = False
+    """addendum: Flag to Load Gaussian Paramters from another scene"""
+
 
 class SplatfactoModel(Model):
     """Nerfstudio's implementation of Gaussian Splatting
@@ -185,41 +191,61 @@ class SplatfactoModel(Model):
         super().__init__(*args, **kwargs)
 
     def populate_modules(self):
-        if self.seed_points is not None and not self.config.random_init:
-            means = torch.nn.Parameter(self.seed_points[0])  # (Location, Color)
-        else:
-            means = torch.nn.Parameter((torch.rand((self.config.num_random, 3)) - 0.5) * self.config.random_scale)
-        self.xys_grad_norm = None
-        self.max_2Dsize = None
-        distances, _ = self.k_nearest_sklearn(means.data, 3)
-        distances = torch.from_numpy(distances)
-        # find the average of the three nearest neighbors for each point and use that as the scale
-        avg_dist = distances.mean(dim=-1, keepdim=True)
-        scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3)))
-        num_points = means.shape[0]
-        quats = torch.nn.Parameter(random_quat_tensor(num_points))
-        dim_sh = num_sh_bases(self.config.sh_degree)
+        # traceback.print_stack()
+        if self.config.flag_load_from_param:
+            print("Loading Gaussian Parameters from another scene")
+            means_file = np.load(self.config.load_param_directory / "means.npy")
+            scales_file = np.load(self.config.load_param_directory / "scales.npy")
+            features_dc_file = np.load(self.config.load_param_directory / "features_dc.npy")
+            features_rest_file = np.load(self.config.load_param_directory / "features_rest.npy")
+            opacities_file = np.load(self.config.load_param_directory / "opacity.npy")
+            quats_file = np.load(self.config.load_param_directory / "quats.npy")
 
-        if (
-            self.seed_points is not None
-            and not self.config.random_init
-            # We can have colors without points.
-            and self.seed_points[1].shape[0] > 0
-        ):
-            shs = torch.zeros((self.seed_points[1].shape[0], dim_sh, 3)).float().cuda()
-            if self.config.sh_degree > 0:
-                shs[:, 0, :3] = RGB2SH(self.seed_points[1] / 255)
-                shs[:, 1:, 3:] = 0.0
+            means = torch.nn.Parameter(torch.tensor(means_file))
+            scales = torch.nn.Parameter(torch.tensor(scales_file))
+            features_dc = torch.nn.Parameter(torch.tensor(features_dc_file))
+            features_rest = torch.nn.Parameter(torch.tensor(features_rest_file))
+            opacities = torch.nn.Parameter(torch.tensor(opacities_file))
+            quats = torch.nn.Parameter(torch.tensor(quats_file))
+            self.xys_grad_norm = None
+            self.max_2Dsize = None
+
+        else:
+            if self.seed_points is not None and not self.config.random_init:
+                means = torch.nn.Parameter(self.seed_points[0])  # (Location, Color)
             else:
-                CONSOLE.log("use color only optimization with sigmoid activation")
-                shs[:, 0, :3] = torch.logit(self.seed_points[1] / 255, eps=1e-10)
-            features_dc = torch.nn.Parameter(shs[:, 0, :])
-            features_rest = torch.nn.Parameter(shs[:, 1:, :])
-        else:
-            features_dc = torch.nn.Parameter(torch.rand(num_points, 3))
-            features_rest = torch.nn.Parameter(torch.zeros((num_points, dim_sh - 1, 3)))
+                means = torch.nn.Parameter((torch.rand((self.config.num_random, 3)) - 0.5) * self.config.random_scale)
+            self.xys_grad_norm = None
+            self.max_2Dsize = None
+            distances, _ = self.k_nearest_sklearn(means.data, 3)
+            distances = torch.from_numpy(distances)
+            # find the average of the three nearest neighbors for each point and use that as the scale
+            avg_dist = distances.mean(dim=-1, keepdim=True)
+            scales = torch.nn.Parameter(torch.log(avg_dist.repeat(1, 3)))
+            num_points = means.shape[0]
+            quats = torch.nn.Parameter(random_quat_tensor(num_points))
+            dim_sh = num_sh_bases(self.config.sh_degree)
 
-        opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
+            if (
+                self.seed_points is not None
+                and not self.config.random_init
+                # We can have colors without points.
+                and self.seed_points[1].shape[0] > 0
+            ):
+                shs = torch.zeros((self.seed_points[1].shape[0], dim_sh, 3)).float().cuda()
+                if self.config.sh_degree > 0:
+                    shs[:, 0, :3] = RGB2SH(self.seed_points[1] / 255)
+                    shs[:, 1:, 3:] = 0.0
+                else:
+                    CONSOLE.log("use color only optimization with sigmoid activation")
+                    shs[:, 0, :3] = torch.logit(self.seed_points[1] / 255, eps=1e-10)
+                features_dc = torch.nn.Parameter(shs[:, 0, :])
+                features_rest = torch.nn.Parameter(shs[:, 1:, :])
+            else:
+                features_dc = torch.nn.Parameter(torch.rand(num_points, 3))
+                features_rest = torch.nn.Parameter(torch.zeros((num_points, dim_sh - 1, 3)))
+
+            opacities = torch.nn.Parameter(torch.logit(0.1 * torch.ones(num_points, 1)))
         self.gauss_params = torch.nn.ParameterDict(
             {
                 "means": means,
@@ -230,6 +256,7 @@ class SplatfactoModel(Model):
                 "opacities": opacities,
             }
         )
+        self.orig_means = torch.nn.Parameter(means)
 
         self.camera_optimizer: CameraOptimizer = self.config.camera_optimizer.setup(
             num_cameras=self.num_train_data, device="cpu"
@@ -445,10 +472,16 @@ class SplatfactoModel(Model):
                     splits |= (self.max_2Dsize > self.config.split_screen_size).squeeze()
                 splits &= high_grads
                 nsamps = self.config.n_split_samples
+                if self.config.flag_load_from_param:
+                    in_orig_masks = torch.all(torch.isin(self.means, self.orig_means), dim=-1)
+                    splits = splits & ~in_orig_masks
                 split_params = self.split_gaussians(splits, nsamps)
 
                 dups = (self.scales.exp().max(dim=-1).values <= self.config.densify_size_thresh).squeeze()
                 dups &= high_grads
+                if self.config.flag_load_from_param:
+                    in_orig_masks = torch.all(torch.isin(self.means, self.orig_means), dim=-1)
+                    dups = dups & ~in_orig_masks
                 dup_params = self.dup_gaussians(dups)
                 for name, param in self.gauss_params.items():
                     self.gauss_params[name] = torch.nn.Parameter(
@@ -518,8 +551,14 @@ class SplatfactoModel(Model):
         """
         n_bef = self.num_points
         # cull transparent ones
-        culls = (torch.sigmoid(self.opacities) < self.config.cull_alpha_thresh).squeeze()
-        below_alpha_count = torch.sum(culls).item()
+        if self.config.flag_load_from_param:
+            below_alpha = (torch.sigmoid(self.opacities) < self.config.cull_alpha_thresh).squeeze()
+            in_orig_masks = torch.all(torch.isin(self.means, self.orig_means), dim=-1)
+            culls = below_alpha & ~in_orig_masks
+            below_alpha_count = torch.sum(below_alpha).item()
+        else:
+            culls = (torch.sigmoid(self.opacities) < self.config.cull_alpha_thresh).squeeze()
+            below_alpha_count = torch.sum(culls).item()
         toobigs_count = 0
         if extra_cull_mask is not None:
             culls = culls | extra_cull_mask

@@ -25,7 +25,7 @@ from typing import Optional
 
 import tyro
 
-from nerfstudio.utils.eval_utils import eval_setup, eval_setup_step
+from nerfstudio.utils.eval_utils import eval_setup_step
 from nerfstudio.utils.rich_utils import CONSOLE
 
 
@@ -39,17 +39,12 @@ class ComputePSNR:
     output_path: Path
     # Step number to load.
     step_num: int
-    # Flag to see if only the latest checkpoint to be loaded (True if yes)
-    flag: bool
     # Optional path to save rendered outputs to.
     render_output_path: Optional[Path] = None
 
     def main(self) -> None:
         """Main function."""
-        if self.flag:
-            config, pipeline, checkpoint_path, _ = eval_setup(self.load_config)
-        else:
-            config, pipeline, checkpoint_path, _ = eval_setup_step(self.load_config, self.step_num)
+        config, pipeline, checkpoint_path, _ = eval_setup_step(self.load_config, self.step_num)
         assert self.output_path.suffix == ".json"
         if self.render_output_path is not None:
             self.render_output_path.mkdir(parents=True, exist_ok=True)
